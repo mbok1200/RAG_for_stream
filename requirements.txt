@@ -1,0 +1,22 @@
+boto3
+# chromadb==1.0.13
+datasets
+python-docx
+ebooklib
+html2text
+langchain==0.3.25
+langchain-aws==0.2.23
+# langchain-chroma==0.2.4
+langchain-huggingface==0.2.0
+langchain-community
+langchain-text-splitters==0.3.8
+numpy
+pandas==2.2.3
+peft==0.15.2
+pypdf==5.5.0
+pymupdf
+streamlit==1.45.1
+tokenizers==0.21.1
+torch==2.7.0
+transformers==4.52.3
+faiss-cpu==1.7.4
