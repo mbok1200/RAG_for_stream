@@ -89,7 +89,7 @@ def extract_paragraphs_from_epub(epub_path, spltting):
                     paragraphs.append(clean)
     return paragraphs
 
-def split_to_paragraphs(text, splitting=True, min_length=200):
+def split_to_paragraphs(text, splitting=True, min_length=50):
     if not splitting:
         return [text.strip()] if text.strip() else []
 
@@ -155,7 +155,7 @@ def sanitize_filename(filename):
 # Load file map from JSON
 def load_file_map():
     try:
-        with open('/home/mikola/projects/ai/config/gdrive_file_map.json', 'r', encoding='utf-8') as f:
+        with open('gdrive_file_map.json', 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception as e:
         return {}
@@ -202,9 +202,14 @@ def extract_text_from_local_file(file_path):
             doc = Document(file_path)
             return "\n".join(para.text for para in doc.paragraphs)
 
-        elif ext in [".txt", ".md"]:  # <-- додано ".md"
+        elif ext in [".txt", ".md"]:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
+                text = f.read()
+            if not text.strip():
+                print(f"⚠️ Markdown-файл порожній: {file_path}")
+            else:
+                print(f"✅ Markdown-файл прочитано ({len(text)} символів): {file_path}")
+            return text
 
         elif ext == ".csv":
             df = pd.read_csv(file_path)

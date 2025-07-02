@@ -1,33 +1,45 @@
 import os
 from pathlib import Path
 import torch
-# Now import everything else
 import streamlit as st
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
-# from langchain_chroma import Chroma
-from langchain.vectorstores import FAISS
+from pinecone import (
+    Pinecone,
+    ServerlessSpec,
+    CloudProvider,
+    AwsRegion,
+    VectorType
+)
 from langchain_aws import ChatBedrock
 import webbrowser
 from helpers.helpers_fn import extract_text_from_local_file, get_all_files, google_cse_search, load_file_map
-# Configuration
-PERSIST_DIR = "db"  # ChromaDB persistence directory
-CHUNK_SIZE = 1300   # Size of text chunks
-CHUNK_OVERLAP = 150  # Overlap between chunks
-EMBEDDING_MODEL = "intfloat/multilingual-e5-base"  # Model for embeddings
-NUM_CHUNKS = 6  # Number of relevant chunks to retrieve
-BEDROCK_MODEL = "anthropic.claude-3-sonnet-20240229-v1:0"  # Claude model version
-AWS_REGION = "us-east-1"  # AWS region for Bedrock
-TEMPERATURE = 0.3  # Temperature for response generation
-MAX_HISTORY = 3  # Maximum number of conversation turns to remember
+import re
+from math import ceil
+def batch_upsert(index, vectors, batch_size=50, namespace="default"):
+    for i in range(0, len(vectors), batch_size):
+        batch = vectors[i:i+batch_size]
+        index.upsert(
+            vectors=batch,
+            namespace=namespace
+        )
+# --- Config ---
+PERSIST_DIR = "db"
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 120
+EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
+NUM_CHUNKS = 6
+BEDROCK_MODEL = "anthropic.claude-3-sonnet-20240229-v1:0"
+AWS_REGION = "us-east-1"
+TEMPERATURE = 0.3
+MAX_HISTORY = 3
 
-# Initialize ChromaDB with persistence
 os.makedirs(PERSIST_DIR, exist_ok=True)
 os.chmod(PERSIST_DIR, 0o770)
-# Initialize LangChain chat model
+
 @st.cache_resource(show_spinner=False)
 def init_chat_model():
     return ChatBedrock(
@@ -36,7 +48,6 @@ def init_chat_model():
         region_name=AWS_REGION
     )
 
-# Initialize embeddings
 @st.cache_resource(show_spinner=False)
 def init_embeddings():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -45,31 +56,25 @@ def init_embeddings():
         model_kwargs={'device': device},
         encode_kwargs={'normalize_embeddings': True}
     )
-@st.cache_resource(show_spinner=False)
-def init_faiss():
-    embeddings = init_embeddings()
-    # Створюємо порожню FAISS базу
-    vectorstore = FAISS.from_texts(["stub"], embedding=embeddings)
-    return vectorstore
-# Initialize ChromaDB and create retriever
-@st.cache_resource(show_spinner=False)
-def init_chromadb():
-    """Initialize ChromaDB with persistence and transformer embeddings"""
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    # Initialize embeddings
-    embeddings = init_embeddings()
-    
-    # Create or load Chroma vector store
-    vectorstore = Chroma(
-        persist_directory=PERSIST_DIR,
-        embedding_function=embeddings,
-        collection_name="documents"
-    )
-    
-    return vectorstore
 
-# Initialize conversation memory
+@st.cache_resource(show_spinner=False)
+def init_pinecone():
+    pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
+    index_name = "streamlit"
+    if index_name not in pc.list_indexes().names():
+        # pc.delete_index(index_name)
+        pc.create_index(
+            name=index_name,
+            dimension=768,
+            spec=ServerlessSpec(
+                cloud=CloudProvider.AWS,
+                region=AwsRegion.US_EAST_1
+            ),
+            vector_type=VectorType.DENSE
+        )
+    idx = pc.Index(index_name)
+    return idx, pc
+
 @st.cache_resource(show_spinner=False)
 def init_memory():
     return ConversationBufferMemory(
@@ -77,12 +82,42 @@ def init_memory():
         return_messages=True,
         output_key="answer"
     )
-
+def to_ascii_id(s):
+    # Залишаємо тільки латиницю, цифри, дефіс, підкреслення і крапку
+    s = s.encode("ascii", "ignore").decode()
+    s = re.sub(r"[^A-Za-z0-9_\-\.]", "_", s)
+    return s
 def handle_segment_change():
     selected = st.session_state["sources"] 
     webbrowser.open_new_tab(file_map[selected])
-# Create the conversation chain
-def create_conversation_chain(llm, retriever, memory):
+
+# --- Custom Pinecone retriever ---
+def pinecone_retrieve(query, embeddings, index, k=NUM_CHUNKS, namespace="default"):
+    query_emb = embeddings.embed_query(query)
+    print("Query embedding shape:", len(query_emb))
+    print("Query embedding (first 5):", query_emb[:5])
+    print("Namespace:", namespace)
+    res = index.query(
+        vector=query_emb,
+        top_k=k,
+        include_metadata=True,
+        namespace=namespace
+    )
+    print("Raw Pinecone query result:", res)
+    # Діагностика: скільки векторів у namespace
+    stats = index.describe_index_stats()
+    print("Pinecone index stats:", stats)
+    docs = []
+    for match in res.matches:
+        docs.append({
+            "page_content": match.metadata.get("text", ""),
+            "metadata": match.metadata
+        })
+    print("Docs found:", len(docs))
+    return docs
+
+# --- LangChain chain with custom retriever ---
+def create_conversation_chain(llm, memory, embeddings, index):
     template = """You are a helpful and friendly AI assistant.
     Your tasks:
     1. Answer questions using the information provided in the documents below.
@@ -103,34 +138,52 @@ def create_conversation_chain(llm, retriever, memory):
 
     Human: {question}
     Assistant:"""
-
     PROMPT = ChatPromptTemplate.from_template(template)
 
-    return ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        combine_docs_chain_kwargs={"prompt": PROMPT},
-        return_source_documents=True,
-        verbose=True
-    )
+    def custom_chain(inputs):
+        question = inputs["question"]
+        docs = pinecone_retrieve(
+            question,
+            embeddings,
+            index,
+            k=NUM_CHUNKS
+        )
+        context = "\n\n".join([doc["page_content"] for doc in docs])
+        print(f"Context:", docs)  # Debugging output
+        prompt = PROMPT.format_prompt(
+            chat_history="\n".join([
+                m['content'] for m in st.session_state.chat_history
+                if isinstance(m, dict) and not m.get("pending")
+            ]),
+            context=context,
+            question=question
+        ).to_string()
+        answer_obj = llm.invoke(prompt)
+        answer = answer_obj.content if hasattr(answer_obj, "content") else str(answer_obj)
+        if not answer.strip():
+            answer = t("no_info")
+        return {
+            "answer": answer,
+            "source_documents": docs
+        }
+    return custom_chain
 
-# Initialize session state
+# --- Session state ---
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 
-if 'vectorstore' not in st.session_state:
-    vectorstore =  init_faiss()#init_chromadb()
-    st.session_state.vectorstore = vectorstore
+if 'pinecone_index' not in st.session_state:
+    pinecone_index, pinecone_client = init_pinecone()
+    st.session_state.pinecone_index = pinecone_index
+    st.session_state.pinecone_client = pinecone_client
+    st.session_state.embeddings = init_embeddings()
     st.session_state.llm = init_chat_model()
     st.session_state.memory = init_memory()
     st.session_state.chain = create_conversation_chain(
         st.session_state.llm,
-        vectorstore.as_retriever(
-            search_type="mmr",
-            search_kwargs={'k': 6, 'lambda_mult': 0.25}
-        ),
-        st.session_state.memory
+        st.session_state.memory,
+        st.session_state.embeddings,
+        pinecone_index
     )
 
 if 'processed_files' not in st.session_state:
@@ -194,12 +247,11 @@ if 'lang' not in st.session_state:
 def t(key, **kwargs):
     return LANGUAGES[st.session_state.lang][key].format(**kwargs)
 
-# --- File map caching ---
 @st.cache_resource(show_spinner=False)
 def get_file_map():
     return load_file_map()
 
-file_map = get_file_map()  # Use cached file_map
+file_map = get_file_map()
 
 # --- Language selector ---
 with st.sidebar:
@@ -218,23 +270,24 @@ st.markdown(t("description"))
 
 with st.sidebar:
     st.header(t("sidebar_header"))
-    # Додаємо чекбокс для очищення ChromaDB
     clear_db = st.checkbox("Очистити ChromaDB перед індексацією", value=False)
     if st.button(t("index_btn")):
         if clear_db:
-            # Видаляємо всі файли з папки db/
             import shutil
             if os.path.exists(PERSIST_DIR):
                 shutil.rmtree(PERSIST_DIR)
                 os.makedirs(PERSIST_DIR, exist_ok=True)
-            # Оновлюємо vectorstore після очищення
-            st.session_state.vectorstore = init_faiss()#init_chromadb()
+            pinecone_index, pinecone_client = init_pinecone()
+            st.session_state.pinecone_index = pinecone_index
+            st.session_state.pinecone_client = pinecone_client
             st.session_state.processed_files = set()
             st.session_state.memory.clear()
         with st.spinner(t("indexing")):
-            root_folder = "/home/mikola/projects/ai/data/structured"
+            root_folder = "data/structured"
             files = get_all_files(root_folder)
             processed_count = 0
+            embeddings = st.session_state.embeddings
+            index = st.session_state.pinecone_index
             for file_path in files:
                 filename = os.path.relpath(file_path, root_folder)
                 source_path = None
@@ -250,7 +303,6 @@ with st.sidebar:
                         separators=["\n\n", "\n", ".", " "]
                     )
                     if filenamesplit in file_map:
-                        # Використовуємо пошук по підрядку (case-insensitive)
                         source_path = None
                         for key in file_map:
                             if filenamesplit.lower() in key.lower():
@@ -260,15 +312,23 @@ with st.sidebar:
                     if not chunks:
                         st.warning(f"{t('error', error='Не вдалося створити непорожні чанки з файлу ' + filename)}")
                         continue
+                    metadatas = [{
+                        "filename": filename,
+                        "type": Path(file_path).suffix,
+                        "source": source_path if source_path else "Unknown",
+                        "text": chunk
+                    } for chunk in chunks]
                     try:
-                        st.session_state.vectorstore.add_texts(
-                            texts=chunks,
-                            metadatas=[{
-                                "filename": filename,
-                                "type": Path(file_path).suffix,
-                                "source": source_path if source_path else "Unknown"
-                            }] * len(chunks)
-                        )
+                        vectors = []
+                        for i, chunk in enumerate(chunks):
+                            vector = embeddings.embed_documents([chunk])[0]
+                            vector_id = to_ascii_id(f"{filename}_{i}")
+                            vectors.append((
+                                vector_id,
+                                vector,
+                                metadatas[i]
+                            ))
+                        batch_upsert(index, vectors, batch_size=50, namespace="default")
                     except Exception as e:
                         st.warning(t("error", error=f"Error adding chunks from {filename}: {e}"))
                     st.session_state.processed_files.add(filename)
@@ -280,7 +340,12 @@ with st.sidebar:
         st.session_state.memory.clear()
         st.rerun()
     if st.button(t("check_docs")):
-        count = st.session_state.vectorstore._collection.count()
+        try:
+            index = st.session_state.pinecone_client.Index("streamlit")
+            stats = index.describe_index_stats()
+            count = stats.get("total_vector_count", 0)
+        except Exception as e:
+            count = f"Error: {e}"
         st.info(t("docs_count", count=count))
     st.segmented_control(
         t("sources"),
@@ -325,8 +390,8 @@ if getattr(st.session_state, "pending_question", None):
                 if result.get("source_documents"):
                     for doc in result["source_documents"]:
                         sources.append({
-                            "filename": doc.metadata.get("filename", "Unknown"),
-                            "text": doc.page_content
+                            "filename": doc["metadata"].get("filename", "Unknown"),
+                            "text": doc["page_content"]
                         })
                 if not sources:
                     google_answer = google_cse_search(st.session_state.pending_question)
